@@ -28,14 +28,16 @@ Finally, we converted the abundance matrix to relative abundances by normalizing
 
 
 ```{r}
-raw <- read.table("merged_metaphlan.txt")
-data <- read.table("new_mat_prop.txt")
-meta <- read.table("DMOF6_merged_metadata_ag copy.txt",
-                              header = TRUE,
-                              sep = "\t",
-                              fill = TRUE,
-                              quote = "",
-                              comment.char = "")
+raw <- read.table("data/merged_metaphlan.txt")
+data <- read.table("data/new_mat_prop.txt")
+meta <- read.table(
+  "data/DMOF6_merged_metadata_ag.txt",
+  header = TRUE,
+  sep = "\t",
+  fill = TRUE,
+  quote = "",
+  comment.char = "")
+
 ```
 
 ```{r}
@@ -153,7 +155,7 @@ combined_diet <- cbind(
 
 write.csv(
   combined_diet,
-  file = "~/Desktop/microbiome/combined_diet.csv"
+  file = "data/combined_diet.csv"
 )
 
 ```
@@ -284,7 +286,7 @@ For the final heatmap, we computed Bray–Curtis dissimilarity between samples a
 
 
 ```{r}
-combined_diet <- read.csv("combined_diet.csv",
+combined_diet <- read.csv("data/combined_diet.csv",
                           header    = TRUE,  
                           row.names = 1,  
                           stringsAsFactors = FALSE)
@@ -435,7 +437,7 @@ suppressMessages(library(tidyverse))
 suppressMessages(library(compositions))   
 
 combined_diet <- read.csv(
-  "combined_diet.csv",
+  "data/combined_diet.csv",
   header           = TRUE,
   row.names        = 1,
   stringsAsFactors = FALSE
@@ -517,7 +519,7 @@ lmm_results <- as.data.frame(results_mat) %>%
 
 
 write.csv(lmm_results,
-           "~/Desktop/microbiome/lmm_taxa.csv",
+           "data/lmm_taxa.csv",
            row.names = FALSE)
 
 
@@ -537,7 +539,7 @@ combined_clr <- combined_clr %>%
   mutate(Group = interaction(Diet, Supplement, sep = "+", drop = TRUE)) %>% 
   relocate(Group, .after = Supplement) 
 write.csv(combined_clr,
-          "~/Desktop/microbiome/combined_clr.csv",
+          "data/combined_clr.csv",
           row.names = TRUE)
 
 ```
@@ -714,7 +716,7 @@ lasso_tbl <- tibble(
 #print(lasso_tbl)
 
 write.csv(lasso_tbl,
-          "~/Desktop/microbiome/lasso_selected_taxa.csv",
+          "data/lasso_selected_taxa.csv",
           row.names = FALSE)
 
 #cat("Number of selected taxa:", nrow(lasso_tbl), "\n")
