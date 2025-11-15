@@ -1,0 +1,1468 @@
+---
+title: "Metaphlan_Result"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    code_folding: "hide"  
+  pdf_document: default
+
+---
+
+```{r setup}
+knitr::opts_chunk$set(
+  echo    = TRUE,   
+  message = FALSE, 
+  warning = FALSE 
+)
+```
+
+## Metaphlan Data preprocessing
+
+We started by importing the metaphlan output, the species-level abundance matrix, and the sample metadata. The metaphlan table was transposed so that rows represent samples and columns represent taxa. We then removed a small set of unwanted samples (week 1, 12, 14, and 16 for mice B3, C3, and E2), and reformatted the remaining sample IDs to match the metadata convention.
+
+In the metadata, we dropped backup samples with IDs containing “B3B”, “C3B”, or “E2B”, and standardized labels so that “B3A”, “C3A”, and “E2A” were replaced by “B3”, “C3”, and “E2” in both the `sampleID` and `Mouse_ID` fields. Using these harmonized IDs, we kept only samples present in both the microbiome table and the metadata and constructed a combined dataset containing the Diet and Supplement variables along with the microbial abundance profiles.
+
+Next, we restricted the feature set to species-level taxa by keeping only columns whose names contained “|s_” and did not contain “|t_”. All microbial abundance columns were converted to numeric values. To reduce sparsity, we counted the number of zeros for each species across samples and retained only those species with zeros in fewer than 10% of samples. We then added a small pseudo-count, defined as one tenth of the smallest non-zero value in the matrix, to all zero entries.
+
+Finally, we converted the abundance matrix to relative abundances by normalizing each row so that each row sum to one, i.e., each entry represents the proportion of that species within a sample. 
+
+
+```{r}
+raw <- read.table("merged_metaphlan.txt")
+data <- read.table("new_mat_prop.txt")
+meta <- read.table("DMOF6_merged_metadata_ag copy.txt",
+                              header = TRUE,
+                              sep = "\t",
+                              fill = TRUE,
+                              quote = "",
+                              comment.char = "")
+```
+
+```{r}
+#flip row and column
+raw_flipped <- as.data.frame(t(raw[,-1])) 
+colnames(raw_flipped) <- raw[[1]] 
+
+rownames(raw_flipped) <- raw_flipped$clade_name
+raw_flipped$clade_name <- NULL
+
+rows_to_remove <- c(
+  "wk12_B3", "wk14_B3", "wk16_B3", "wk1_B3",
+  "wk12_C3", "wk14_C3", "wk16_C3", "wk1_C3",
+  "wk12_E2", "wk14_E2", "wk16_E2", "wk1_E2"
+)
+raw_flipped <- raw_flipped[ !(rownames(raw_flipped) %in% rows_to_remove), ]
+
+#modify row names
+filtered <- raw_flipped
+rownames(filtered) <- sub("^wk(\\d+)_([A-Za-z0-9]+)$", "DMOF6_\\2_wk\\1", rownames(filtered))
+
+```
+
+```{r}
+library(dplyr)
+library(stringr)
+library(tibble)
+
+meta_clean <- meta %>% 
+  filter(!str_detect(sampleID, "B3B|E2B|C3B")) %>%     #delete 12 rows
+  mutate(
+    sampleID = str_replace_all(sampleID, c("B3A" = "B3", "C3A" = "C3", "E2A" = "E2")),
+    Mouse_ID = str_replace_all(Mouse_ID, c("B3A" = "B3", "C3A" = "C3", "E2A" = "E2"))
+  )
+
+common_ids <- intersect(rownames(filtered), meta_clean$sampleID)
+#length(common_ids)
+
+#combine metadata and filtered
+missing_ids <- setdiff(rownames(filtered), meta_clean$sampleID)
+#missing_ids
+
+filtered_sub <- filtered[common_ids, , drop = FALSE]
+
+meta_sub <- meta_clean %>%
+  filter(sampleID %in% common_ids) %>%
+  arrange(match(sampleID, common_ids)) %>%     
+  column_to_rownames("sampleID")              
+
+combined <- cbind(meta_sub, filtered_sub)   #combined data with all columns
+
+diet_col <- meta_clean %>% 
+  filter(sampleID %in% common_ids) %>% 
+  arrange(match(sampleID, common_ids)) %>%      
+  pull(Diet)                                    
+
+supp_col <- meta_clean %>% 
+  filter(sampleID %in% common_ids) %>% 
+  arrange(match(sampleID, common_ids)) %>%      
+  pull(Supplement)                              
+
+combined_diet <- cbind(
+  Diet        = diet_col,
+  Supplement  = supp_col,
+  filtered_sub
+)                              
+ #combined data with Diet, Supplement
+```
+
+```{r}
+#filter out column according to names
+cols_keep <- colnames(combined_diet) %in% c("Diet", "Supplement") | (
+               grepl("\\|s_", colnames(combined_diet)) &  # must contain “|s_”, only leave species
+               !grepl("t_",  colnames(combined_diet)) # not contain “|t_”, remove all of the taxa 
+             ) 
+
+combined_diet <- combined_diet[ , cols_keep]
+```
+
+```{r}
+#convert to numeric
+combined_diet <- combined_diet %>%
+  mutate(across(-c(Diet, Supplement), ~ as.numeric(as.character(.))))
+
+
+#count zeros
+non_meta_cols <- setdiff(names(combined_diet), c("Diet", "Supplement"))
+zero_counts   <- colSums(combined_diet[ , non_meta_cols] == 0, na.rm = TRUE)
+
+n_samples <- nrow(combined_diet)
+thr       <- 0.10 * n_samples 
+
+taxa_keep <- non_meta_cols[ zero_counts < thr ]
+
+combined_diet <- combined_diet[ , c("Diet", "Supplement", taxa_keep) ]
+
+```
+
+```{r}
+
+mat <- as.matrix(combined_diet[ , -c(1,2)]) 
+
+pseudo <- min(mat[mat > 0]) / 10        
+mat[mat == 0] <- pseudo  
+
+#pseudo
+
+mat_prop <- sweep(mat, 1, rowSums(mat), "/")
+
+combined_diet <- cbind(
+  Diet        = combined_diet$Diet,
+  Supplement  = combined_diet$Supplement,
+  mat_prop
+)
+
+write.csv(
+  combined_diet,
+  file = "~/Desktop/microbiome/combined_diet.csv"
+)
+
+```
+
+
+## Alpha/ Beta Diversity
+
+We first quantified within-sample (alpha) diversity using the Shannon index. For each sample, we computed Shannon diversity from the species-level relative abundance matrix and compared its distribution across weeks using boxplots with overlaid jittered points. We also stratified the analysis by diet group (Lean vs High-Fat) to visualize how alpha diversity changes over time under different dietary conditions.
+
+To assess between-sample (beta) diversity, we calculated Bray–Curtis dissimilarity on the same abundance matrix. We then performed principal coordinates analysis (PCoA) on the Bray–Curtis distance matrix and plotted the first two axes, with points colored by week and shaped by diet. This provides a low-dimensional view of how microbial community composition varies across time and diet groups.
+
+
+```{r}
+
+suppressMessages(library(vegan))
+suppressMessages(library(ggplot2))
+suppressMessages(library(dplyr))
+
+combined_diet <- as.data.frame(combined_diet)
+
+combined_diet$SampleID <- rownames(combined_diet)
+
+combined_diet$Week <- sub(".*_(wk\\d+)$", "\\1", combined_diet$SampleID)
+combined_diet$Week <- factor(combined_diet$Week, levels = c("wk1", "wk12", "wk14", "wk16"))
+
+abundance_cols <- setdiff(colnames(combined_diet), c("Diet", "Supplement", "SampleID", "Week"))
+abundance_data <- combined_diet[, abundance_cols]
+
+abundance_data <- as.data.frame(sapply(abundance_data, as.numeric))
+
+
+combined_diet$Shannon <- diversity(abundance_data, index = "shannon")
+
+
+ggplot(combined_diet, aes(x = Week, y = Shannon)) +
+  geom_boxplot(fill = "skyblue", outlier.shape = NA) +
+  geom_jitter(width = 0.2, size = 1.5, alpha = 0.5) +
+  labs(
+    title = "Shannon Diversity Index across Weeks",
+    x = "Week",
+    y = "Shannon Index"
+  ) +
+  theme_minimal()
+
+```
+
+```{r}
+
+combined_lean <- combined_diet %>% filter(Diet == "Lean")
+combined_hf   <- combined_diet %>% filter(Diet == "HighFat")
+
+
+p1 <- ggplot(combined_lean, aes(x = Week, y = Shannon)) +
+  geom_boxplot(fill = "lightgreen", outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.4, size = 1.5) +
+  labs(title = "Lean Diet", x = "Week", y = "Shannon Index") +
+  theme_minimal()
+
+
+p2 <- ggplot(combined_hf, aes(x = Week, y = Shannon)) +
+  geom_boxplot(fill = "lightyellow", outlier.shape = NA) +
+  geom_jitter(width = 0.2, alpha = 0.4, size = 1.5) +
+  labs(title = "High-Fat Diet", x = "Week", y = "Shannon Index") +
+  theme_minimal()
+
+
+p1
+p2
+
+```
+
+```{r}
+
+suppressMessages(library(vegan))
+suppressMessages(library(dplyr))
+suppressMessages(library(ggplot2))
+suppressMessages(library(tibble))
+
+
+abundance_data <- as.data.frame(sapply(abundance_data, as.numeric))
+
+
+# Calsulate Bray–Curtis β-diversity
+dist_bray <- vegan::vegdist(abundance_data, method = "bray")  # 或 vegdist(ab_hell, "bray")
+
+
+pcoa_fit <- cmdscale(dist_bray, k = 2, eig = TRUE)
+pcoa_df <- tibble(
+  SampleID = combined_diet$SampleID,
+  PC1 = pcoa_fit$points[, 1],
+  PC2 = pcoa_fit$points[, 2]
+) %>%
+  left_join(combined_diet[, c("SampleID", "Diet", "Supplement", "Week")], by = "SampleID")
+
+
+eig_vals <- pcoa_fit$eig[pcoa_fit$eig > 0]
+var_exp <- eig_vals / sum(eig_vals)
+pc1_var <- if (length(var_exp) >= 1) round(100 * var_exp[1], 1) else NA
+pc2_var <- if (length(var_exp) >= 2) round(100 * var_exp[2], 1) else NA
+
+
+ggplot(pcoa_df, aes(x = PC1, y = PC2, color = Week, shape = Diet)) +
+  geom_point(size = 2, alpha = 0.9) +
+  labs(
+    title = paste0(
+      "PCoA on Bray–Curtis β-diversity",
+      if (!is.na(pc1_var) && !is.na(pc2_var))
+        paste0(" (PC1 ", pc1_var, "%, PC2 ", pc2_var, "%)")
+    ),
+    x = "PCoA 1", y = "PCoA 2"
+  ) +
+  theme_minimal() +
+  theme(legend.title = element_text(size = 10),
+        legend.text  = element_text(size = 9))
+
+```
+
+
+
+
+## Heatmap and Hierarchical Clustering
+
+To visualize overall community structure, we first constructed a species-level proportion matrix from the processed MetaPhlAn data, with rows corresponding to samples and columns corresponding to taxa. As an initial exploratory step, we generated an unsupervised heatmap in which both samples and taxa were clustered, providing a global view of abundance patterns without any metadata overlays.
+
+We then explored the appropriate number of sample clusters using hierarchical clustering on the taxa proportion matrix with Ward’s \(D^2\) linkage. Using the `fviz_nbclust` function, we examined three standard diagnostics—the within-cluster sum of squares (elbow), average silhouette width, and the gap statistic—across a range of cluster numbers. These criteria helped guide the choice of a low-dimensional cluster structure for summarizing between-sample differences.
+
+For the final heatmap, we computed Bray–Curtis dissimilarity between samples and applied hierarchical clustering with Ward’s \(D^2\) method to order the columns. Species (rows) were clustered in the usual way to group taxa with similar abundance profiles. We added a top annotation bar to display key experimental variables: diet (Lean vs HighFat), supplement type (Cellulose vs Oligofructose), and sampling week (wk1, wk12, wk14, wk16), each encoded with a consistent color scheme. The resulting heatmap highlights major gradients in species composition while simultaneously showing how these patterns relate to diet, supplement, and time point. The plot was also saved as a high-resolution PNG file for use in reports and presentations.
+
+
+```{r}
+combined_diet <- read.csv("combined_diet.csv",
+                          header    = TRUE,  
+                          row.names = 1,  
+                          stringsAsFactors = FALSE)
+
+suppressMessages(library(tidyverse))
+suppressMessages(library(ComplexHeatmap))
+suppressMessages(library(factoextra))
+suppressMessages(library(cluster))   
+suppressMessages(library(cowplot))
+
+taxa_prop <- combined_diet %>%
+  select(-Diet, -Supplement) %>%      
+  as.matrix()
+
+#initial heatmap
+
+suppressMessages(
+taxa_prop %>% 
+  t() %>%               
+  Heatmap(name            = "abundance",
+          cluster_rows    = TRUE,
+          cluster_columns = TRUE,
+          column_labels   = rep(" ", nrow(taxa_prop)), 
+          row_labels      = rep(" ", ncol(taxa_prop)),  
+          row_names_gp    = gpar(fontsize = 1.5),
+          column_title    = "Taxa Abundance Heatmap before clustering" )
+)
+
+
+cat("Elbow")
+# Elbow
+fviz_nbclust(taxa_prop, hcut, method = "wss", hc_method = "ward.D2")
+```
+
+
+
+```{r}
+# Silhouette 
+
+cat("Silhouette")
+fviz_nbclust(taxa_prop, hcut, method = "silhouette", hc_method = "ward.D2")
+```
+
+```{r}
+
+# Gap Statistic 
+
+cat("Gap Statistic")
+set.seed(1)
+gap_stat <- clusGap(taxa_prop, FUN = hcut, K.max = 10, B = 50)
+fviz_gap_stat(gap_stat)
+
+```
+
+
+```{r}
+
+bc_dist   <- vegdist(taxa_prop, method = "bray")
+clust.res <- hclust(bc_dist, method = "ward.D2")
+k         <- 2
+my.clusts <- cutree(clust.res, k = k)
+
+# cluster color
+cluster_col <- setNames(c("orange", "green4"), c("1", "2"))
+
+
+samples <- rownames(taxa_prop)
+
+## Diet
+diet_vec <- factor(
+  combined_diet[samples, "Diet"],                 
+  levels = c("Lean", "HighFat")
+)
+
+diet_col <- c(Lean = "#4f8ad1",   
+              HighFat = "#d9534f")
+
+## Week
+get_week <- function(x) {
+  if (grepl("_wk1$",  x, ignore.case = TRUE)) "wk1"
+  else if (grepl("wk12", x, ignore.case = TRUE)) "wk12"
+  else if (grepl("wk14", x, ignore.case = TRUE)) "wk14"
+  else if (grepl("wk16", x, ignore.case = TRUE)) "wk16"
+  else NA_character_
+}
+
+week_vec <- factor(
+  vapply(samples, get_week, character(1)),
+  levels = c("wk1", "wk12", "wk14", "wk16")
+)
+
+week_col <- c(wk1  = "#0080ff",   
+              wk12 = "#ffcf00",   
+              wk14 = "#ff66b2",   
+              wk16 = "#00a651")   
+
+
+#Supplement
+supp_vec <- factor(
+  combined_diet[samples, "Supplement"],
+  levels = c("Cellulose", "Oligofructose")
+)
+
+supp_col <- c(Cellulose      = "#8da0cb",
+              Oligofructose  = "#fc8d62")
+
+
+#annotation
+top_anno <- HeatmapAnnotation(
+  supp = supp_vec,
+  diet = diet_vec,
+  week = week_vec,
+  col  = list(
+    diet = diet_col,
+    week = week_col,
+    supp = supp_col
+  ),
+  annotation_name_side = "left",
+  annotation_height    = unit(c(4, 4, 4), "mm")
+)
+
+suppressMessages(
+ht <- taxa_prop %>%
+  t() %>%                           
+  Heatmap(
+    name                        = "abundance",
+    clustering_method_columns   = "ward.D2",
+    clustering_distance_columns = function(M) vegdist(M, "bray"),
+    column_labels               = rep(" ", nrow(taxa_prop)),   
+    row_labels                  = rep(" ", ncol(taxa_prop)),  
+    top_annotation              = top_anno,
+    column_title    = "Taxa Abundance Heatmap Hierarchical clustering" 
+  )
+)
+draw(ht)
+
+png("~/Desktop/heatmap.png", width = 2400, height = 1800, res = 300)
+draw(ht)
+invisible(dev.off())
+
+
+```
+
+### CLR Transformation
+
+```{r}
+suppressMessages(library(tidyverse))
+suppressMessages(library(compositions))   
+
+combined_diet <- read.csv(
+  "combined_diet.csv",
+  header           = TRUE,
+  row.names        = 1,
+  stringsAsFactors = FALSE
+)
+
+diet_col <- combined_diet$Diet
+supp_col  <- combined_diet$Supplement
+
+taxa_mat <- combined_diet %>% 
+  select(-Diet, -Supplement) %>%        
+  as.matrix()
+
+clr_mat <- clr(taxa_mat)   
+
+combined_clr <- data.frame(
+  Diet = diet_col,
+  Supplement = supp_col,
+  clr_mat,
+  check.names = FALSE
+)
+
+
+row_sums <- rowSums(clr_mat)
+
+```
+
+
+### Linear Mixed Model for all samples
+```{r}
+#LMM and BH
+
+suppressMessages(library(nlme))         
+
+combined_clr <- combined_clr %>%
+  rownames_to_column("SampleID") %>% 
+  separate(SampleID,
+           into   = c("Batch", "MouseID", "Week"),
+           sep    = "_",
+           remove = FALSE) %>% 
+  mutate(
+    MouseID = factor(MouseID),
+    Week    = factor(Week, levels = c("wk1", "wk12", "wk14", "wk16")),
+    Diet    = factor(Diet, levels = c("Lean", "HighFat")),
+    Supplement = factor(Supplement, levels = c("Cellulose","Oligofructose"))
+  )
+
+#create an empty matrix
+taxa_cols <- setdiff(colnames(combined_clr),
+                     c("SampleID","Batch","MouseID","Week","Diet","Supplement"))
+
+n_taxa <- length(taxa_cols)
+results_mat <- matrix(NA, nrow = n_taxa, ncol = 3,
+                      dimnames = list(taxa_cols,
+                                      c("t_value", "p_value", "p_adj")))
+
+for (i in seq_along(taxa_cols)) {
+  taxon <- taxa_cols[i]
+
+  df_tmp <- combined_clr %>%
+    select(Abundance = all_of(taxon), Diet, Supplement, Week, MouseID)
+  
+  mod <- lme(fixed   = Abundance ~ Diet + Supplement + Week, #control Supplement and Week
+             random  = ~1 | MouseID,
+             data    = df_tmp,
+             na.action = na.exclude,
+             method  = "ML")  
+  
+#get t and p
+  tt <- summary(mod)$tTable
+  results_mat[i, "t_value"] <- tt["DietHighFat", "t-value"]
+  results_mat[i, "p_value"] <- tt["DietHighFat", "p-value"]
+}
+
+results_mat[, "p_adj"] <- p.adjust(results_mat[, "p_value"], "BH")
+
+lmm_results <- as.data.frame(results_mat) %>%
+  rownames_to_column("Taxon") %>%
+  arrange(p_adj)
+
+
+write.csv(lmm_results,
+           "~/Desktop/microbiome/lmm_taxa.csv",
+           row.names = FALSE)
+
+
+
+sig_tbl <- lmm_results %>% 
+  filter(p_adj < 0.05) %>%                   
+  select(Taxon, t_value, p_value, p_adj) %>%  
+  arrange(p_adj)                             
+
+
+
+```
+
+```{r}
+
+combined_clr <- combined_clr %>% 
+  mutate(Group = interaction(Diet, Supplement, sep = "+", drop = TRUE)) %>% 
+  relocate(Group, .after = Supplement) 
+write.csv(combined_clr,
+          "~/Desktop/microbiome/combined_clr.csv",
+          row.names = TRUE)
+
+```
+
+
+
+### Lasso Regression
+
+
+```{r, echo=FALSE, message=FALSE, warning=FALSE}
+suppressMessages(library(tidyverse))
+suppressMessages(library(glmnet))
+suppressMessages(library(stringr))
+suppressMessages(library(ggplot2))
+suppressMessages(library(ggpubr))
+
+taxa_cols <- setdiff(
+  colnames(combined_clr),
+  c("SampleID","Batch","MouseID","Week","Diet","Supplement","Group")
+)
+
+
+weeks <- levels(combined_clr$Week)
+if (is.null(weeks) || length(weeks) == 0) {
+
+  weeks <- sort(unique(combined_clr$Week))
+}
+
+cat("## LASSO by Week")
+
+for (wk in weeks) {
+  df_w <- combined_clr %>% dplyr::filter(.data$Week == wk)
+
+  if (nrow(df_w) < 10 || length(unique(df_w$Diet)) < 2) {
+    cat(sprintf("**%s:** insufficient samples or only one Diet class; skipped.**\n\n", wk))
+    next
+  }
+
+  y <- ifelse(df_w$Diet == "HighFat", 1, 0)
+  X <- as.matrix(df_w[, taxa_cols, drop = FALSE])
+
+  nzv <- apply(X, 2, sd, na.rm = TRUE) > 0
+  X   <- X[, nzv, drop = FALSE]
+  if (ncol(X) == 0) {
+    cat(sprintf("**%s:** no variable taxa after filtering; skipped.**\n\n", wk))
+    next
+  }
+
+  set.seed(1)
+  cvfit <- cv.glmnet(
+    x = X, y = y, family = "binomial",
+    alpha = 1, nfolds = 10, standardize = TRUE
+  )
+  lambda_opt <- cvfit$lambda.1se
+
+  fit <- glmnet(
+    x = X, y = y, family = "binomial",
+    alpha = 1, lambda = lambda_opt, standardize = TRUE
+  )
+
+  coef_vec <- as.matrix(coef(fit))[, 1]
+  sel_idx  <- which(coef_vec[-1] != 0)
+  selected_taxa <- names(coef_vec)[-1][sel_idx]
+
+  if (!exists("lasso_selected_by_week")) lasso_selected_by_week <- list()
+  lasso_selected_by_week[[wk]] <- selected_taxa
+
+
+  cat(sprintf("### %s\n\n", wk))
+  cat(sprintf("**Number of selected taxa:** %d\n\n", length(selected_taxa)))
+
+  if (length(selected_taxa) == 0) next
+
+  lasso_tbl <- tibble(
+    Taxon       = selected_taxa,
+    Coefficient = as.numeric(coef_vec[-1][sel_idx]),
+    Direction   = ifelse(Coefficient > 0, "HighFat↑", "Lean↑")
+  ) %>%
+    arrange(desc(abs(Coefficient))) %>%
+    mutate(ShortTaxon = str_extract(Taxon, "[^\\.]+$"))
+
+  
+  p_bar <- ggplot(lasso_tbl,
+                  aes(x = reorder(ShortTaxon, Coefficient),
+                      y = Coefficient, fill = Direction)) +
+    geom_col() +
+    coord_flip() +
+    labs(
+      title = paste0("LASSO-Selected Taxa (", wk, ")"),
+      x = "Taxon", y = "LASSO Coefficient"
+    ) +
+    scale_fill_manual(values = c("HighFat↑" = "tomato", "Lean↑" = "skyblue")) +
+    theme_minimal(base_size = 12) +
+    theme(legend.position = "top")
+  print(p_bar)
+
+  keep_cols <- intersect(lasso_tbl$Taxon, colnames(df_w))
+  if (length(keep_cols) > 0) {
+    long_df <- df_w %>%
+      dplyr::select(Diet, all_of(keep_cols)) %>%
+      tidyr::pivot_longer(cols = -Diet, names_to = "Taxon", values_to = "CLR")
+
+    p_vio <- ggplot(long_df, aes(x = Diet, y = CLR, fill = Diet)) +
+      geom_violin(trim = FALSE, alpha = 0.4, scale = "width") +
+      geom_jitter(width = 0.2, size = 1.0, alpha = 0.4, color = "black") +
+      ggpubr::stat_compare_means(method = "wilcox.test", label = "p.signif") +
+      facet_wrap(~ Taxon, scales = "free_y", ncol = 4) +
+      labs(
+        title = paste0("CLR of LASSO-Selected Taxa by Diet (", wk, ")"),
+        x = "Diet", y = "CLR value"
+      ) +
+      theme_minimal(base_size = 11) +
+      theme(
+        strip.text = element_text(size = 9, face = "bold"),
+        legend.position = "top"
+      )
+    print(p_vio)
+  }
+
+  cat("\n")
+}
+
+```
+
+
+
+```{r}
+
+cat("Lasso across all weeks")
+
+suppressMessages(library(tidyverse))
+suppressMessages(library(glmnet))    
+set.seed(1)       
+
+
+y <- ifelse(combined_clr$Diet == "HighFat", 1, 0)          # 0/1 outcome
+
+X <- combined_clr %>%                                    
+  select(-SampleID, -Batch, -MouseID, -Week,
+         -Diet, -Supplement, -Group) %>%                 
+  as.matrix()
+
+cvfit <- cv.glmnet(
+  x       = X,
+  y       = y,
+  family  = "binomial",  
+  alpha   = 1,           
+  nfolds  = 10,
+  standardize = TRUE
+)
+
+lambda_opt <- cvfit$lambda.1se 
+
+# Diet ~ CLRtransformed abundance
+fit <- glmnet(
+  x           = X,
+  y           = y,
+  family      = "binomial",
+  alpha       = 1,
+  lambda      = lambda_opt,
+  standardize = TRUE
+)
+
+coef_vec <- coef(fit)                   
+sel_idx  <- which(coef_vec[-1, 1] != 0) 
+selected_taxa <- rownames(coef_vec)[-1][sel_idx]
+
+lasso_tbl <- tibble(
+  Taxon      = selected_taxa,
+  Coefficient = as.numeric(coef_vec[-1, 1][sel_idx]),
+  Direction  = ifelse(Coefficient > 0, "HighFat↑", "Lean↑")
+) %>% arrange(desc(abs(Coefficient)))
+
+#print(lasso_tbl)
+
+write.csv(lasso_tbl,
+          "~/Desktop/microbiome/lasso_selected_taxa.csv",
+          row.names = FALSE)
+
+#cat("Number of selected taxa:", nrow(lasso_tbl), "\n")
+
+```
+**Number of significant taxa:** `r nrow(lasso_tbl)`
+
+
+```{r}
+
+coef_vec <- coef(fit)
+coef_df <- data.frame(
+  Taxon = rownames(coef_vec),
+  Coefficient = as.numeric(coef_vec[, 1])
+) %>%
+  filter(Taxon != "(Intercept)")
+
+#coef_df
+
+```
+
+```{r}
+library(stringr)
+library(ggplot2)
+
+lasso_tbl <- lasso_tbl %>%
+  mutate(
+    ShortTaxon = str_extract(Taxon, "[^\\.]+$")  
+  )
+ggplot(lasso_tbl, aes(x = reorder(ShortTaxon, Coefficient), y = Coefficient, fill = Direction)) +
+  geom_col() +
+  coord_flip() +
+  labs(
+    title = "Lasso-Selected Taxa",
+    x = "Taxon",
+    y = "Lasso Coefficient"
+  ) +
+  scale_fill_manual(values = c("HighFat↑" = "tomato", "Lean↑" = "skyblue")) +
+  theme_minimal(base_size = 12)
+
+```   
+
+
+```{r}
+
+library(ggpubr)
+
+selected_taxa <- lasso_tbl$Taxon 
+
+long_df <- combined_diet %>%
+  select(Diet, all_of(selected_taxa)) %>%  
+  pivot_longer(
+    cols = -Diet,
+    names_to = "Taxon",
+    values_to = "Abundance"
+  )
+
+ggplot(long_df, aes(x = Diet, y = Abundance, fill = Diet)) +
+  geom_violin(trim = FALSE, alpha = 0.4, scale = "width") +
+  geom_jitter(width = 0.2, size = 1.2, alpha = 0.4, color = "black") +
+  stat_compare_means(method = "wilcox.test", label = "p.signif") + 
+  facet_wrap(~ Taxon, scales = "free_y", ncol = 4) +
+  labs(
+    title = "Abundance of Lasso-Selected Taxa by Diet",
+    x = "Diet",
+    y = "Abundance"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    strip.text = element_text(size = 9, face = "bold"),
+    legend.position = "top"
+  )
+
+ggsave("lasso_violin_plot.png", width = 16, height = 16, dpi = 300)
+
+#selected_taxa
+```
+
+# Predictive Modeling
+
+```{r}
+suppressMessages(library(tidyverse))
+suppressMessages(library(glmnet))
+suppressMessages(library(knitr))
+suppressMessages(library(kableExtra))
+
+set.seed(1)
+
+weeks <- c("wk1", "wk12", "wk14", "wk16")
+
+taxa_cols <- setdiff(
+  colnames(combined_clr),
+  c("SampleID","Batch","MouseID","Week","Diet","Supplement","Group")
+)
+
+n_repeats <- 50 
+results_list <- list()
+
+for (wk in weeks) {
+  df_w <- combined_clr %>% dplyr::filter(.data$Week == wk)
+
+  n_samples <- nrow(df_w)
+  diet_tab  <- table(df_w$Diet)
+  lean_n    <- unname(ifelse("Lean"    %in% names(diet_tab), diet_tab["Lean"],    0))
+  hf_n      <- unname(ifelse("HighFat" %in% names(diet_tab), diet_tab["HighFat"], 0))
+
+
+  if (n_samples < 10 || length(unique(df_w$Diet)) < 2) {
+    results_list[[wk]] <- tibble(
+      Week = wk, N = n_samples, Lean = as.integer(lean_n), HighFat = as.integer(hf_n),
+      Train_Error_Mean = NA_real_, Train_Error_SD = NA_real_,
+      Test_Error_Mean  = NA_real_, Test_Error_SD  = NA_real_
+    )
+    next
+  }
+
+  y <- ifelse(df_w$Diet == "HighFat", 1, 0)
+  X <- as.matrix(df_w[, taxa_cols, drop = FALSE])
+
+
+  nzv <- apply(X, 2, sd, na.rm = TRUE) > 0
+  X   <- X[, nzv, drop = FALSE]
+
+  if (ncol(X) == 0) {
+    results_list[[wk]] <- tibble(
+      Week = wk, N = n_samples, Lean = as.integer(lean_n), HighFat = as.integer(hf_n),
+      Train_Error_Mean = NA_real_, Train_Error_SD = NA_real_,
+      Test_Error_Mean  = NA_real_, Test_Error_SD  = NA_real_
+    )
+    next
+  }
+
+  train_errs <- numeric(n_repeats)
+  test_errs  <- numeric(n_repeats)
+
+  for (r in seq_len(n_repeats)) {
+    set.seed(r)
+    n <- nrow(X)
+    tr_idx <- sample(seq_len(n), size = floor(0.8 * n))
+
+    X_tr <- X[tr_idx, , drop = FALSE]
+    y_tr <- y[tr_idx]
+    X_te <- X[-tr_idx, , drop = FALSE]
+    y_te <- y[-tr_idx]
+
+    cvfit <- cv.glmnet(
+      x = X_tr, y = y_tr,
+      family = "binomial", alpha = 1,
+      nfolds = 10, standardize = TRUE
+    )
+    fit <- glmnet(
+      x = X_tr, y = y_tr,
+      family = "binomial", alpha = 1,
+      lambda = cvfit$lambda.1se, standardize = TRUE
+    )
+
+    pred_tr <- ifelse(predict(fit, X_tr, type = "response") > 0.5, 1, 0)
+    pred_te <- ifelse(predict(fit, X_te, type = "response") > 0.5, 1, 0)
+
+    train_errs[r] <- mean(pred_tr != y_tr)
+    test_errs[r]  <- mean(pred_te != y_te)
+  }
+
+  results_list[[wk]] <- tibble(
+    Week = wk,
+    N = n_samples,
+    Lean = as.integer(lean_n),
+    HighFat = as.integer(hf_n),
+    `Train Error (mean)` = mean(train_errs),
+    `Train Error (sd)`   = sd(train_errs),
+    `Test Error (mean)`  = mean(test_errs),
+    `Test Error (sd)`    = sd(test_errs)
+  )
+}
+
+results_tbl <- bind_rows(results_list) %>%
+  dplyr::mutate(
+    Week = factor(Week, levels = c("wk1","wk12","wk14","wk16"))
+  ) %>%
+  dplyr::arrange(Week) %>%
+  dplyr::mutate(
+    dplyr::across(where(is.numeric), ~ round(., 3))
+  )
+
+knitr::kable(
+  results_tbl,
+  format  = "html",
+  caption = "Predictive modeling by week (LASSO, 50 repeats of 80/20 splits)",
+  align   = "lrrrrrrrr"
+) %>%
+  kableExtra::kable_styling(
+    full_width = FALSE,
+    bootstrap_options = c("striped", "hover", "condensed", "responsive")
+  )
+
+```
+
+
+
+```{r}
+suppressMessages(library(glmnet))
+suppressMessages(library(tidyverse))
+suppressMessages(library(knitr))
+suppressMessages(library(kableExtra))
+
+set.seed(1)
+
+n_repeats <- 50
+train_error_vec <- numeric(n_repeats)
+test_error_vec  <- numeric(n_repeats)
+
+for (r in seq_len(n_repeats)) {
+  set.seed(r)
+ 
+  n <- nrow(X)
+  train_idx <- sample(1:n, size = 0.8 * n)
+  X_train <- X[train_idx, ]
+  y_train <- y[train_idx]
+  X_test  <- X[-train_idx, ]
+  y_test  <- y[-train_idx]
+
+  cvfit_train <- cv.glmnet(
+    x = X_train,
+    y = y_train,
+    family = "binomial",
+    alpha = 1,
+    nfolds = 10,
+    standardize = TRUE
+  )
+  lambda_opt <- cvfit_train$lambda.1se
+
+  fit_train <- glmnet(
+    x = X_train,
+    y = y_train,
+    family = "binomial",
+    alpha = 1,
+    lambda = lambda_opt,
+    standardize = TRUE
+  )
+
+  yhat_train <- predict(fit_train, X_train, type = "response")
+  yhat_test  <- predict(fit_train, X_test,  type = "response")
+
+  pred_train <- ifelse(yhat_train > 0.5, 1, 0)
+  pred_test  <- ifelse(yhat_test  > 0.5, 1, 0)
+
+  train_error <- mean(pred_train != y_train)
+  test_error  <- mean(pred_test  != y_test)
+
+
+  train_error_vec[r] <- train_error
+  test_error_vec[r]  <- test_error
+}
+
+results_tbl <- tibble(
+  N = 112,
+  `Train Error (mean)` = mean(train_error_vec),
+  `Train Error (sd)`   = sd(train_error_vec),
+  `Test Error (mean)`  = mean(test_error_vec),
+  `Test Error (sd)`    = sd(test_error_vec),
+  `Null Model Error`   = 0.5
+) |>
+  mutate(across(where(is.numeric), ~ round(., 3)))
+
+knitr::kable(
+  results_tbl,
+  format  = "html",
+  caption = "Predictive modeling across all weeks(LASSO, 50 repeats of 80/20 splits)",
+  align   = "rrrrrr"
+) |>
+  kableExtra::kable_styling(
+    full_width = FALSE,
+    bootstrap_options = c("striped", "hover", "condensed", "responsive")
+  )
+
+```
+
+
+
+# Cooccurrence Plot
+
+```{r}
+suppressMessages(library(igraph))
+suppressMessages(library(stringr))
+suppressMessages(library(dplyr))
+
+stopifnot(exists("combined_clr"), exists("weeks"))
+stopifnot(exists("lasso_selected_by_week")) 
+
+rescale01 <- function(x, to = c(0.6, 3.8)) {
+  r <- range(x, na.rm = TRUE)
+  if (!is.finite(r[1]) || !is.finite(r[2]) || r[2] - r[1] == 0) {
+    return(rep(mean(to), length(x)))
+  }
+  (x - r[1]) / (r[2] - r[1]) * (to[2] - to[1]) + to[1]
+}
+
+# EBIC
+ebic <- function(rss, df, n, p, gamma = 0.5) n*log(rss/n) + df*log(n) + 2*gamma*df*log(p)
+gamma <- 0.5
+tau   <- 0  
+
+for (wk in weeks) {
+  cat("\n### Week:", wk, "\n")
+
+  sel_names <- lasso_selected_by_week[[wk]]
+  if (is.null(sel_names) || length(sel_names) <= 1) {
+    cat("No significant taxa in this week; skipped.\n")
+    next
+  }
+
+  df_w <- combined_clr %>% dplyr::filter(.data$Week == wk)
+
+  sel_names <- intersect(sel_names, colnames(df_w))
+  if (length(sel_names) <= 1) {
+    cat("Selected taxa not present in this week; skipped.\n")
+    next
+  }
+
+  X <- as.matrix(df_w[, sel_names, drop = FALSE])
+  n <- nrow(X); p <- ncol(X)
+  colnames(X) <- sel_names
+
+
+  set.seed(1)
+  B <- matrix(0, p, p, dimnames = list(colnames(X), colnames(X)))
+  for (i in seq_len(p)) {
+    y  <- X[, i]
+    Xo <- X[, -i, drop = FALSE]
+    fit  <- glmnet::glmnet(x = Xo, y = y, alpha = 1, family = "gaussian", standardize = TRUE)
+    Yhat <- predict(fit, Xo)
+    rss  <- colSums((y - Yhat)^2)
+    k    <- which.min(ebic(rss, fit$df, n, p - 1, gamma = gamma))
+    co   <- as.numeric(coef(fit, s = fit$lambda[k]))[-1]
+    B[i, -i] <- co
+  }
+
+
+  W <- (B + t(B)) / 2
+  diag(W) <- 0
+
+  adj <- (W != 0) * 1
+  g   <- igraph::graph_from_adjacency_matrix(adj, mode = "undirected", diag = FALSE)
+
+  get_w <- function(W, g) {
+    el <- igraph::as_edgelist(g, names = FALSE)
+    apply(el, 1, function(ix) W[ix[1], ix[2]])
+  }
+  w <- get_w(W, g)
+
+
+  keep_e <- which(abs(w) >= tau)
+  if (length(keep_e) == 0) {
+    cat(sprintf("No edges with |coef| >= %.2f; skipped.\n", tau))
+    next
+  }
+  g_tau <- igraph::subgraph.edges(g, eids = keep_e, delete.vertices = FALSE)
+  w_tau <- get_w(W, g_tau)
+
+
+  coords <- igraph::layout_in_circle(g_tau)
+  theta  <- atan2(coords[,2], coords[,1])
+
+  short_names <- sapply(igraph::V(g_tau)$name, function(x){
+    sp <- stringr::str_extract(x, "(?<=\\.s__)[^\\._]+")
+    if (!is.na(sp) && nzchar(sp)) return(sp)
+    ge <- stringr::str_extract(x, "(?<=\\.g__)[^\\._]+")
+    if (!is.na(ge) && nzchar(ge)) return(ge)
+    tail(strsplit(x, "_", fixed = TRUE)[[1]], 1)
+  })
+
+  ang_deg_raw <- theta * 180 / pi
+  flip  <- (ang_deg_raw > 90 & ang_deg_raw < 270)
+  ang_deg <- ifelse(flip, ang_deg_raw - 180, ang_deg_raw)
+  hjust   <- ifelse(flip, 1, 0)
+
+  #plot
+  e_width <- rescale01(abs(w_tau), to = c(0.6, 4.0))
+  e_color <- ifelse(w_tau >= 0, "steelblue", "firebrick")
+  e_curve <- 0.15
+  node_cols <- grDevices::rainbow(igraph::vcount(g_tau), s = 0.9, v = 0.9)
+
+  enlarge   <- 1.30
+  lab_push  <- 1.08
+  label_cex <- 0.55
+  layout_scaled <- coords * enlarge
+  lab_xy_scaled <- cbind(coords[,1]*enlarge*lab_push, coords[,2]*enlarge*lab_push)
+  lim <- 1.02 * enlarge * lab_push
+
+  op <- par(mar = c(3,3,5,3), xpd = NA, xaxs = "i", yaxs = "i")
+  plot(
+    g_tau,
+    layout = layout_scaled,
+    vertex.size = 4.2,
+    vertex.label = NA,
+    vertex.color = node_cols,
+    vertex.frame.color = NA,
+    edge.width = e_width,
+    edge.color = e_color,
+    edge.curved = e_curve,
+    rescale = FALSE,
+    xlim = c(-lim, lim), ylim = c(-lim, lim),
+    asp = 1
+  )
+  title(sprintf("Week %s Taxa Co-occurrence |coef| ≥ %.2f", wk, tau), line = 3)
+
+  for (i in seq_len(igraph::vcount(g_tau))) {
+    text(lab_xy_scaled[i,1], lab_xy_scaled[i,2], short_names[i],
+         srt = ang_deg[i], adj = hjust[i],
+         cex = label_cex, col = "black")
+  }
+  par(op)
+}
+```
+
+```{r}
+suppressMessages(library(igraph))
+suppressMessages(library(stringr))
+
+
+rescale01 <- function(x, to = c(0.6, 3.8)) {
+  r <- range(x, na.rm = TRUE)
+  if (!is.finite(r[1]) || !is.finite(r[2]) || r[2] - r[1] == 0) {
+    return(rep(mean(to), length(x)))
+  }
+  (x - r[1]) / (r[2] - r[1]) * (to[2] - to[1]) + to[1]
+}
+
+
+groups <- unique(combined_clr$Group)
+
+for (gname in groups) {
+  cat("\n### Group:", gname, "\n")
+  
+
+  df_g <- combined_clr %>% dplyr::filter(Group == gname)
+  
+  sel_names <- NULL
+  if (exists("selected_taxa")) sel_names <- selected_taxa
+  if (is.null(sel_names) && exists("lasso_tbl")) sel_names <- unique(lasso_tbl$Taxon)
+  
+  if (is.null(sel_names) || length(sel_names) <= 1) {
+    cat("No significant taxa for this group; skipped.\n")
+    next
+  }
+  
+
+  X <- as.matrix(df_g[, sel_names, drop = FALSE])
+  colnames(X) <- sel_names
+  n <- nrow(X); p <- ncol(X)
+  
+
+  ebic <- function(rss, df, n, p, gamma = 0.5) {
+    n*log(rss/n) + df*log(n) + 2*gamma*df*log(p)
+  }
+  gamma <- 0.5
+  
+  B <- matrix(0, p, p, dimnames = list(colnames(X), colnames(X)))
+  for (i in seq_len(p)) {
+    y  <- X[, i]
+    Xo <- X[, -i, drop = FALSE]
+    fit  <- glmnet(x = Xo, y = y, alpha = 1, family = "gaussian", standardize = TRUE)
+    Yhat <- predict(fit, Xo)
+    rss  <- colSums((y - Yhat)^2)
+    k    <- which.min(ebic(rss, fit$df, n, p - 1, gamma = gamma))
+    co   <- as.numeric(coef(fit, s = fit$lambda[k]))[-1]
+    B[i, -i] <- co
+  }
+  
+  W <- (B + t(B)) / 2
+  diag(W) <- 0
+  
+
+  adj <- (W != 0) * 1
+  g   <- graph_from_adjacency_matrix(adj, mode = "undirected", diag = FALSE)
+  
+  get_w <- function(W, g) {
+    el <- as_edgelist(g, names = FALSE)
+    apply(el, 1, function(ix) W[ix[1], ix[2]])
+  }
+  w        <- get_w(W, g)
+  e_width  <- rescale01(abs(w), to = c(0.6, 4.0))
+  e_color  <- ifelse(w >= 0, "steelblue", "firebrick")
+  e_curve  <- 0.15
+  node_cols <- grDevices::rainbow(vcount(g), s = 0.9, v = 0.9)
+  
+  coords <- layout_in_circle(g)
+  theta  <- atan2(coords[,2], coords[,1])
+  short_names <- sapply(V(g)$name, function(x){
+    sp <- str_extract(x, "(?<=\\.s__)[^\\._]+")
+    if (!is.na(sp) && nzchar(sp)) return(sp)
+    ge <- str_extract(x, "(?<=\\.g__)[^\\._]+")
+    if (!is.na(ge) && nzchar(ge)) return(ge)
+    tail(strsplit(x, "_", fixed = TRUE)[[1]], 1)
+  })
+  flip  <- (theta * 180 / pi > 90 & theta * 180 / pi < 270)
+  ang_deg <- ifelse(flip, theta*180/pi - 180, theta*180/pi)
+  hjust   <- ifelse(flip, 1, 0)
+  
+
+  tau   <- 0
+  keep_e <- which(abs(w) >= tau)
+  g_tau  <- subgraph.edges(g, eids = keep_e, delete.vertices = FALSE)
+  w_tau  <- get_w(W, g_tau)
+  
+  enlarge   <- 1.30
+  lab_push  <- 1.08
+  label_cex <- 0.55
+  layout_scaled <- coords * enlarge
+  lab_xy_scaled <- cbind(coords[,1]*enlarge*lab_push, coords[,2]*enlarge*lab_push)
+  lim <- 1.02 * enlarge * lab_push
+  
+  op <- par(mar = c(3,3,5,3), xpd = NA, xaxs = "i", yaxs = "i")
+  plot(
+    g_tau,
+    layout = layout_scaled,
+    vertex.size = 4.2,
+    vertex.label = NA,
+    vertex.color = node_cols,
+    vertex.frame.color = NA,
+    edge.width = rescale01(abs(w_tau), to = c(0.6, 4.0)),
+    edge.color = ifelse(w_tau >= 0, "steelblue", "firebrick"),
+    edge.curved = e_curve,
+    rescale = FALSE,
+    xlim = c(-lim, lim), ylim = c(-lim, lim),
+    asp = 1
+  )
+  title(sprintf("Group: %s Taxa Co-occurrence |coef| ≥ %.2f", gname, tau), line = 3)
+  
+  for (i in seq_len(vcount(g_tau))) {
+    text(lab_xy_scaled[i,1], lab_xy_scaled[i,2], short_names[i],
+         srt = ang_deg[i], adj = hjust[i],
+         cex = label_cex, col = "black")
+  }
+  par(op)
+}
+
+```
+
+
+
+
+
+```{r}
+suppressMessages(library(dplyr))
+suppressMessages(library(stringr))
+
+sel_names <- NULL
+if (exists("selected_taxa")) sel_names <- selected_taxa
+if (is.null(sel_names) && exists("lasso_tbl")) sel_names <- unique(lasso_tbl$Taxon)
+stopifnot("no available taxa" = length(sel_names) > 1)
+message("Using ", length(sel_names), " taxa")
+
+
+X <- as.matrix(combined_clr[, sel_names, drop = FALSE])
+colnames(X) <- sel_names
+n <- nrow(X); p <- ncol(X)
+
+
+ebic <- function(rss, df, n, p, gamma = 0.5) n*log(rss/n) + df*log(n) + 2*gamma*df*log(p)
+gamma <- 0.5    
+set.seed(1)
+
+
+B <- matrix(0, p, p, dimnames = list(colnames(X), colnames(X)))
+
+for (i in seq_len(p)) {
+  y  <- X[, i]
+  Xo <- X[, -i, drop = FALSE]
+
+
+  fit  <- glmnet(x = Xo, y = y, alpha = 1, family = "gaussian", standardize = TRUE)
+
+  Yhat <- predict(fit, Xo)                      
+  rss  <- colSums((y - Yhat)^2)
+  k    <- which.min(ebic(rss, fit$df, n, p - 1, gamma = gamma))
+
+
+  co   <- as.numeric(coef(fit, s = fit$lambda[k]))[-1]
+  B[i, -i] <- co
+}
+
+W <- (B + t(B)) / 2
+diag(W) <- 0
+
+idx <- which(W != 0, arr.ind = TRUE)
+edges_df <- data.frame(
+  from = colnames(W)[idx[,1]],
+  to   = colnames(W)[idx[,2]],
+  coef = W[idx],
+  stringsAsFactors = FALSE
+)
+
+
+edges_df <- edges_df[edges_df$from < edges_df$to, , drop = FALSE]
+
+
+edges_df <- edges_df[order(-abs(edges_df$coef)), , drop = FALSE]
+
+```
+**#Taxa:** `r p`    **#Non-zero edges:** `r nrow(edges_df)`
+
+
+
+```{r}
+library(igraph)
+library(stringr)
+
+rescale01 <- function(x, to = c(0.6, 3.8)) {
+  r <- range(x, na.rm = TRUE)
+  if (!is.finite(r[1]) || !is.finite(r[2]) || r[2] - r[1] == 0) {
+    return(rep(mean(to), length(x)))
+  }
+  (x - r[1]) / (r[2] - r[1]) * (to[2] - to[1]) + to[1]
+}
+
+stopifnot(exists("W"), is.matrix(W), !is.null(colnames(W)), nrow(W) == ncol(W))
+
+
+adj <- (W != 0) * 1
+g   <- graph_from_adjacency_matrix(adj, mode = "undirected", diag = FALSE)
+
+
+get_w <- function(W, g) {
+  el <- as_edgelist(g, names = FALSE)
+  apply(el, 1, function(ix) W[ix[1], ix[2]])
+}
+w        <- get_w(W, g)
+e_width  <- rescale01(abs(w), to = c(0.6, 4.0))      # higher correlation if wider
+e_color  <- ifelse(w >= 0, "steelblue", "firebrick")  # positive: blue, negative: red
+e_curve  <- 0.15
+
+
+set.seed(1)
+node_cols <- grDevices::rainbow(vcount(g), s = 0.9, v = 0.9)
+
+coords <- layout_in_circle(g)
+theta  <- atan2(coords[,2], coords[,1])
+
+short_names <- sapply(V(g)$name, function(x){
+  sp <- str_extract(x, "(?<=\\.s__)[^\\._]+")
+  if (!is.na(sp) && nzchar(sp)) return(sp)
+  ge <- str_extract(x, "(?<=\\.g__)[^\\._]+")
+  if (!is.na(ge) && nzchar(ge)) return(ge)
+  tail(strsplit(x, "_", fixed = TRUE)[[1]], 1)
+})
+
+lab_r  <- 1.12
+lab_xy <- cbind(coords[,1]*lab_r, coords[,2]*lab_r)
+
+ang_deg_raw <- theta * 180 / pi
+flip        <- (ang_deg_raw > 90 & ang_deg_raw < 270)
+ang_deg     <- ifelse(flip, ang_deg_raw - 180, ang_deg_raw)
+hjust       <- ifelse(flip, 1, 0)
+
+enlarge   <- 1.30     
+lab_push  <- 1.08   
+label_cex <- 0.55   
+
+layout_scaled <- coords * enlarge
+lab_xy_scaled <- cbind(coords[,1]*enlarge*lab_push, coords[,2]*enlarge*lab_push)
+lim <- 1.02 * enlarge * lab_push  
+
+op <- par(mar = c(3,3,5,3), xpd = NA, xaxs = "i", yaxs = "i")
+set.seed(123)
+plot(
+  g,
+  layout = layout_scaled,
+  vertex.size = 4.2,
+  vertex.label = NA,
+  vertex.color = node_cols,
+  vertex.frame.color = NA,
+  edge.width = e_width,
+  edge.color = e_color,
+  edge.curved = e_curve,
+  rescale = FALSE,                        
+  xlim = c(-lim, lim), ylim = c(-lim, lim),
+  asp = 1                              
+)
+title(main = "Taxa Co-occurrence across all weeks with |coef| ≥ 0", line = 4)
+
+for (i in seq_len(vcount(g))) {
+  text(
+    x = lab_xy_scaled[i, 1],
+    y = lab_xy_scaled[i, 2],
+    labels = short_names[i],
+    srt = ang_deg[i],
+    adj = hjust[i],
+    cex = label_cex,                    
+    col = "black"
+  )
+}
+par(op)
+
+plot_circle_net <- function(g_obj, w_vec, title_txt,
+                            enlarge = 1.30, lab_push = 1.08,
+                            label_cex = 0.55, top_mar = 5) {
+
+  e_width <- rescale01(abs(w_vec), to = c(0.6, 4.0))
+  e_color <- ifelse(w_vec >= 0, "steelblue", "firebrick")
+
+  layout_scaled <- coords * enlarge
+  lab_xy_scaled <- cbind(coords[,1]*enlarge*lab_push, coords[,2]*enlarge*lab_push)
+  lim <- 1.02 * enlarge * lab_push
+
+  op <- par(mar = c(3,3,top_mar,3), xpd = NA, xaxs = "i", yaxs = "i")
+  plot(
+    g_obj,
+    layout = layout_scaled,
+    vertex.size = 4.2,
+    vertex.label = NA,
+    vertex.color = node_cols,
+    vertex.frame.color = NA,
+    edge.width = e_width,
+    edge.color = e_color,
+    edge.curved = e_curve,
+    rescale = FALSE,                      # ★ 放大生效
+    xlim = c(-lim, lim), ylim = c(-lim, lim),
+    asp = 1
+  )
+  title(main = title_txt, line = 2)
+
+  for (i in seq_len(vcount(g_obj))) {
+    text(lab_xy_scaled[i,1], lab_xy_scaled[i,2], short_names[i],
+         srt = ang_deg[i], adj = hjust[i],
+         cex = label_cex, col = "black")
+  }
+  par(op)
+}
+
+
+tau   <- 0.1
+keep_e <- which(abs(w) >= tau)
+g_tau  <- subgraph.edges(g, eids = keep_e, delete.vertices = FALSE)
+w_tau  <- get_w(W, g_tau)
+
+plot_circle_net(
+  g_obj     = g_tau,
+  w_vec     = w_tau,
+  title_txt = "", 
+  enlarge   = 1.30,
+  lab_push  = 1.08,
+  label_cex = 0.55,
+  top_mar   = 6
+)
+title(sprintf("Taxa Co-occurrence across all weeks with |coef| ≥ %.2f", tau), line = 2.5) 
+
+```
+
+
+
