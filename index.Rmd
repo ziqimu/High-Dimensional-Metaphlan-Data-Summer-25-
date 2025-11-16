@@ -274,8 +274,6 @@ ggplot(pcoa_df, aes(x = PC1, y = PC2, color = Week, shape = Diet)) +
 ```
 
 
-
-
 ## Heatmap and Hierarchical Clustering
 
 To visualize overall structure, we generated an heatmap in which both samples and taxa were clustered, providing a global view of abundance patterns without any metadata overlays.
@@ -548,7 +546,7 @@ write.csv(combined_clr,
 
 
 
-### Lasso Regression
+## Lasso Regression
 
 To find taxa that best separate Lean and High-Fat diets, we fit LASSO logistic regression models using the CLR-transformed abundance matrix. Diet (HighFat vs Lean) was the binary outcome, and species-level CLR values were the predictors.
 
