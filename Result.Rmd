@@ -163,9 +163,9 @@ write.csv(
 
 ## Alpha/ Beta Diversity
 
-We first quantified within-sample (alpha) diversity using the Shannon index. For each sample, we computed Shannon diversity from the species-level relative abundance matrix and compared its distribution across weeks using boxplots with overlaid jittered points. We also stratified the analysis by diet group (Lean vs High-Fat) to visualize how alpha diversity changes over time under different dietary conditions.
+We first quantified within-sample (alpha) diversity using the Shannon index. For each sample, we computed Shannon diversity from the species-level relative abundance matrix and compared its distribution across weeks using boxplots. We also stratified the analysis by diet group (Lean vs High-Fat) to visualize how alpha diversity changes over time under different dietary conditions.
 
-To assess between-sample (beta) diversity, we calculated Bray–Curtis dissimilarity on the same abundance matrix. We then performed principal coordinates analysis (PCoA) on the Bray–Curtis distance matrix and plotted the first two axes, with points colored by week and shaped by diet. This provides a low-dimensional view of how microbial community composition varies across time and diet groups.
+To assess between-sample (beta) diversity, we calculated Bray–Curtis dissimilarity on the same abundance matrix. We then performed principal coordinates analysis (PCoA) on the Bray–Curtis distance matrix and plotted the first two axes, with points colored by week and shaped by diet.
 
 
 ```{r}
@@ -278,12 +278,11 @@ ggplot(pcoa_df, aes(x = PC1, y = PC2, color = Week, shape = Diet)) +
 
 ## Heatmap and Hierarchical Clustering
 
-To visualize overall community structure, we first constructed a species-level proportion matrix from the processed MetaPhlAn data, with rows corresponding to samples and columns corresponding to taxa. As an initial exploratory step, we generated an unsupervised heatmap in which both samples and taxa were clustered, providing a global view of abundance patterns without any metadata overlays.
+To visualize overall structure, we generated an heatmap in which both samples and taxa were clustered, providing a global view of abundance patterns without any metadata overlays.
 
-We then explored the appropriate number of sample clusters using hierarchical clustering on the taxa proportion matrix with Ward’s \(D^2\) linkage. Using the `fviz_nbclust` function, we examined three standard diagnostics—the within-cluster sum of squares (elbow), average silhouette width, and the gap statistic—across a range of cluster numbers. These criteria helped guide the choice of a low-dimensional cluster structure for summarizing between-sample differences.
+We then explored the appropriate number of clusters using hierarchical clustering on the taxa proportion matrix with Ward’s \(D^2\) linkage. We examined three standard diagnostics—the within-cluster sum of squares (elbow), average silhouette width, and the gap statistic—across a range of cluster numbers. 
 
-For the final heatmap, we computed Bray–Curtis dissimilarity between samples and applied hierarchical clustering with Ward’s \(D^2\) method to order the columns. Species (rows) were clustered in the usual way to group taxa with similar abundance profiles. We added a top annotation bar to display key experimental variables: diet (Lean vs HighFat), supplement type (Cellulose vs Oligofructose), and sampling week (wk1, wk12, wk14, wk16), each encoded with a consistent color scheme. The resulting heatmap highlights major gradients in species composition while simultaneously showing how these patterns relate to diet, supplement, and time point. The plot was also saved as a high-resolution PNG file for use in reports and presentations.
-
+For the final heatmap, we clustered samples into two groups using hierarchical clustering with Ward’s D² method, by cutting the dendrogram at k=2. We added a top annotation bar to show three key variables: diet (Lean vs HighFat), supplement (Cellulose vs Oligofructose), and week (wk1, wk12, wk14, wk16). 
 
 ```{r}
 combined_diet <- read.csv("data/combined_diet.csv",
@@ -432,6 +431,8 @@ invisible(dev.off())
 
 ### CLR Transformation
 
+We applied the centered log-ratio (CLR) transformation to the species-level proportion matrix. 
+
 ```{r}
 suppressMessages(library(tidyverse))
 suppressMessages(library(compositions))   
@@ -465,8 +466,9 @@ row_sums <- rowSums(clr_mat)
 ```
 
 
-### Linear Mixed Model for all samples
-```{r}
+
+```{r, include=FALSE}
+# Linear Mixed Model for all samples
 #LMM and BH
 
 suppressMessages(library(nlme))         
@@ -548,6 +550,9 @@ write.csv(combined_clr,
 
 ### Lasso Regression
 
+To find taxa that best separate Lean and High-Fat diets, we fit LASSO logistic regression models using the CLR-transformed abundance matrix. Diet (HighFat vs Lean) was the binary outcome, and species-level CLR values were the predictors.
+
+First, we fit separate LASSO models at each week and across all weeks. For each time point, we used 10-fold cross-validation with the 1-SE rule to choose the penalty $\lambda$ and then recorded the taxa with non-zero coefficients. Positive coefficients correspond to taxa enriched in the High-Fat group, and negative coefficients correspond to taxa enriched in the Lean group. For these selected taxa, we made bar plots of the coefficients and violin plots of CLR values by diet.
 
 ```{r, echo=FALSE, message=FALSE, warning=FALSE}
 suppressMessages(library(tidyverse))
@@ -797,6 +802,8 @@ ggsave("lasso_violin_plot.png", width = 16, height = 16, dpi = 300)
 
 # Predictive Modeling
 
+We evaluated how well the microbiome profile can predict diet. For each week (wk1, wk12, wk14, wk16), we restricted to samples where both diet groups were present and removed taxa with zero variance. We then repeatedly split the data into 80% training and 20% test sets (50 repeats). In each repeat, similar to the previous step, we used cross-validated LASSO (with the 1-SE rule for $\lambda$) on the training set and recorded the misclassification error on both training and test sets. The summary table shows, for each week, the number of Lean and High-Fat samples, along with the mean and standard deviation of the train and test errors across the 50 repeats. We applied the same procedure to all weeks combined. The null model error(random guessing) is 0.5 since the outcome is binary. Since the observed test error is lower than this benchmark, it suggests that the model provides meaningful predictive signal for distinguishing Lean from High-Fat diets.
+
 ```{r}
 suppressMessages(library(tidyverse))
 suppressMessages(library(glmnet))
@@ -997,6 +1004,9 @@ knitr::kable(
 
 
 # Cooccurrence Plot
+
+To explore how taxa vary together, we constructed co-occurrence networks using the CLR-transformed abundance data. For each week, we took the taxa selected by the LASSO models and, one taxon at a time, regressed it on the others using LASSO. The penalty was chosen by minimizing an extended BIC (EBIC). 
+I repeated the same neighborhood-selection procedure within each Diet + Supplement group, and once again using all samples combined. In the network plots, nodes represent taxa and edges indicate nonzero conditional associations. Edge width reflects the strength of the association, and edge color shows its sign (blue for positive, red for negative).
 
 ```{r}
 suppressMessages(library(igraph))
